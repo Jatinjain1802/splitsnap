@@ -106,7 +106,7 @@ function createApp(db, opts = {}) {
     const t = useToken(req.body.token, 'verify'); if (!t) return res.status(400).json({ error: 'This verification link is invalid or expired' });
     db.prepare('UPDATE users SET email_verified=1 WHERE id=?').run(t.user_id); res.json({ ok: true });
   });
-  app.use(['/api/groups', '/api/ocr', '/api/parse-text', '/api/claim'], needUser);
+  app.use(['/api/groups', '/api/ocr', '/api/parse-text', '/api/claim', '/api/notifications'], needUser);
 
   const wrap = fn => (req, res) => { try { fn(req, res); } catch (e) { res.status(e.status || 400).json({ error: e.message }); } };
   const bad = (msg, status = 400) => { const e = new Error(msg); e.status = status; throw e; };
@@ -117,7 +117,44 @@ function createApp(db, opts = {}) {
     if (!g) bad('Group not found', 404); return g;
   };
   const myMember = (req, g) => db.prepare('SELECT id FROM members WHERE group_id=? AND user_id=?').get(g.id, req.user.id).id;
+
+  // In-app reminders. No email or push; they only exist inside the app.
+  app.get('/api/notifications', wrap((req, res) => {
+    const items = db.prepare('SELECT id,text,group_id,created_at,read_at FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 30').all(req.user.id)
+      .map(i => ({ id: i.id, text: i.text, group_id: i.group_id, created_at: i.created_at, read: !!i.read_at }));
+    res.json({ unread: items.filter(i => !i.read).length, items });
+  }));
+  app.post('/api/notifications/read', wrap((req, res) => { db.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE user_id=? AND read_at IS NULL').run(req.user.id); res.json({ ok: true }); }));
   const membersOf = id => db.prepare('SELECT id,name FROM members WHERE group_id=? ORDER BY id').all(id);
+  const fmtMoney = (p, c) => `${(p / 100).toFixed(2)} ${c || 'INR'}`;
+  // In-app reminders only: a row per linked member (guests have no account to notify). No email or push.
+  function notifyGroup(groupId, actorId, text) {
+    const ins = db.prepare('INSERT INTO notifications(user_id,group_id,text) VALUES(?,?,?)');
+    for (const m of db.prepare('SELECT user_id u FROM members WHERE group_id=? AND user_id IS NOT NULL').all(groupId)) if (m.u !== actorId) ins.run(m.u, groupId, text);
+  }
+  const advance = (d, freq) => {
+    const dt = new Date(d + 'T00:00:00Z');
+    if (freq === 'weekly') dt.setUTCDate(dt.getUTCDate() + 7);
+    else { const day = dt.getUTCDate(); dt.setUTCMonth(dt.getUTCMonth() + 1); if (dt.getUTCDate() !== day) dt.setUTCDate(0); }
+    return dt.toISOString().slice(0, 10);
+  };
+  // Turn due recurring rules into real expenses. Idempotent: next_due always moves forward.
+  function materialize(groupId) {
+    const today = new Date().toISOString().slice(0, 10);
+    for (const r of db.prepare('SELECT * FROM recurring WHERE group_id=? AND next_due<=?').all(groupId, today)) {
+      let due = r.next_due, n = 0;
+      db.transaction(() => {
+        while (due <= today && n < 24) {
+          const eId = db.prepare('INSERT INTO expenses(group_id,description,amount,paid_by,split_type,note,created_by,spent_on,category,spec_json,currency) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+            .run(r.group_id, r.description, r.amount, r.paid_by, r.split_type, r.note, r.created_by, due, r.category, r.spec_json, r.currency).lastInsertRowid;
+          for (const s of computeShares(r.split_type, r.amount, JSON.parse(r.spec_json || '{}'))) db.prepare('INSERT INTO splits VALUES(?,?,?)').run(eId, s.member_id, s.share);
+          due = advance(due, r.freq); n++;
+        }
+        db.prepare('UPDATE recurring SET next_due=? WHERE id=?').run(due, r.id);
+      })();
+      if (n) notifyGroup(r.group_id, null, `Recurring expense "${r.description}" was added${n > 1 ? ` (${n} caught up)` : ''}`);
+    }
+  }
 
   app.get('/api/groups', wrap((req, res) => res.json(db.prepare('SELECT g.id,g.name,g.created_at FROM groups g JOIN members m ON m.group_id=g.id WHERE m.user_id=? ORDER BY g.id DESC').all(req.user.id))));
   app.post('/api/groups', wrap((req, res) => {
@@ -131,7 +168,11 @@ function createApp(db, opts = {}) {
     })();
     res.status(201).json({ id });
   }));
-  app.delete('/api/groups/:id', wrap((req, res) => { if (gid(req).owner_id !== req.user.id) bad('Only the group owner can delete it', 403); db.prepare('DELETE FROM groups WHERE id=?').run(+req.params.id); res.json({ ok: true }); }));
+  app.delete('/api/groups/:id', wrap((req, res) => {
+    const g = gid(req); if (g.owner_id !== req.user.id) bad('Only the group owner can delete it', 403);
+    for (const e of db.prepare('SELECT receipt_file f FROM expenses WHERE group_id=? AND receipt_file IS NOT NULL').all(g.id)) fs.unlink(path.join(receiptDir, e.f), () => {});
+    db.prepare('DELETE FROM groups WHERE id=?').run(g.id); res.json({ ok: true });
+  }));
   app.post('/api/groups/:id/members', wrap((req, res) => {
     const g = gid(req); let name, uid = null;
     if (req.body.email) {
@@ -144,26 +185,34 @@ function createApp(db, opts = {}) {
     catch (e) { bad('That name already exists in this group'); }
   }));
 
-  function balances(groupId) {
+  // Every currency stays separate: no invented exchange rates, no conversion.
+  function balances(groupId, currency) {
     const net = new Map(membersOf(groupId).map(m => [m.id, 0]));
-    for (const r of db.prepare('SELECT paid_by p, amount a FROM expenses WHERE group_id=?').all(groupId)) net.set(r.p, net.get(r.p) + r.a);
-    for (const r of db.prepare('SELECT s.member_id m, s.share h FROM splits s JOIN expenses e ON e.id=s.expense_id WHERE e.group_id=?').all(groupId)) net.set(r.m, net.get(r.m) - r.h);
-    for (const r of db.prepare('SELECT from_member f, to_member t, amount a FROM settlements WHERE group_id=?').all(groupId)) { net.set(r.f, net.get(r.f) + r.a); net.set(r.t, net.get(r.t) - r.a); }
+    for (const r of db.prepare('SELECT paid_by p, amount a FROM expenses WHERE group_id=? AND currency=?').all(groupId, currency)) net.set(r.p, net.get(r.p) + r.a);
+    for (const r of db.prepare('SELECT s.member_id m, s.share h FROM splits s JOIN expenses e ON e.id=s.expense_id WHERE e.group_id=? AND e.currency=?').all(groupId, currency)) net.set(r.m, net.get(r.m) - r.h);
+    for (const r of db.prepare('SELECT from_member f, to_member t, amount a FROM settlements WHERE group_id=? AND currency=?').all(groupId, currency)) { net.set(r.f, net.get(r.f) + r.a); net.set(r.t, net.get(r.t) - r.a); }
     return net;
   }
 
   app.get('/api/groups/:id', wrap((req, res) => {
-    const g = gid(req); const members = db.prepare('SELECT id,name,user_id IS NOT NULL AS is_user FROM members WHERE group_id=? ORDER BY id').all(g.id); const net = balances(g.id);
-    const expenses = db.prepare('SELECT id,description,amount,paid_by,split_type,spent_on,category,note,spec_json,receipt_file IS NOT NULL AS has_receipt,ocr_text IS NOT NULL AS has_ocr,created_by,edited_at,created_at FROM expenses WHERE group_id=? ORDER BY id DESC LIMIT 200').all(g.id);
+    const g = gid(req); materialize(g.id);
+    const members = db.prepare('SELECT id,name,user_id IS NOT NULL AS is_user FROM members WHERE group_id=? ORDER BY id').all(g.id);
+    const expenses = db.prepare('SELECT id,description,amount,currency,paid_by,split_type,spent_on,category,note,spec_json,receipt_file IS NOT NULL AS has_receipt,ocr_text IS NOT NULL AS has_ocr,created_by,edited_at,created_at FROM expenses WHERE group_id=? ORDER BY id DESC LIMIT 200').all(g.id);
     const sp = db.prepare('SELECT member_id,share FROM splits WHERE expense_id=?');
     expenses.forEach(e => { e.splits = sp.all(e.id); e.spec = e.spec_json ? JSON.parse(e.spec_json) : null; delete e.spec_json; e.can_edit = e.created_by === req.user.id || g.owner_id === req.user.id; delete e.created_by; e.has_receipt = !!e.has_receipt; e.has_ocr = !!e.has_ocr; });
-    const settlements = db.prepare('SELECT id,from_member,to_member,amount,created_at FROM settlements WHERE group_id=? ORDER BY id DESC LIMIT 100').all(g.id);
-    const paid = new Map(), owed = new Map();
-    for (const r of db.prepare('SELECT paid_by p, SUM(amount) a FROM expenses WHERE group_id=? GROUP BY paid_by').all(g.id)) paid.set(r.p, r.a);
-    for (const r of db.prepare('SELECT s.member_id m, SUM(s.share) a FROM splits s JOIN expenses e ON e.id=s.expense_id WHERE e.group_id=? GROUP BY s.member_id').all(g.id)) owed.set(r.m, r.a);
-    res.json({ me: myMember(req, g), group: { id: g.id, name: g.name, is_owner: g.owner_id === req.user.id }, members: members.map(m => ({ ...m, is_user: !!m.is_user })), expenses, settlements,
-      totals: { spent: [...paid.values()].reduce((a, b) => a + b, 0), per_member: members.map(m => ({ member_id: m.id, paid: paid.get(m.id) || 0, share: owed.get(m.id) || 0 })) },
-      balances: members.map(m => ({ member_id: m.id, net: net.get(m.id) })), suggested: simplify(net) });
+    const settlements = db.prepare('SELECT id,from_member,to_member,amount,currency,created_at FROM settlements WHERE group_id=? ORDER BY id DESC LIMIT 100').all(g.id);
+    const curs = db.prepare('SELECT currency c FROM expenses WHERE group_id=? UNION SELECT currency c FROM settlements WHERE group_id=? ORDER BY c').all(g.id, g.id).map(r => r.c);
+    const paid = db.prepare('SELECT paid_by p, currency c, SUM(amount) a FROM expenses WHERE group_id=? GROUP BY paid_by, currency').all(g.id);
+    const owed = db.prepare('SELECT s.member_id m, e.currency c, SUM(s.share) a FROM splits s JOIN expenses e ON e.id=s.expense_id WHERE e.group_id=? GROUP BY s.member_id, e.currency').all(g.id);
+    const perCur = cur => {
+      const net = balances(g.id, cur);
+      return { currency: cur, spent: paid.filter(r => r.c === cur).reduce((a, r) => a + r.a, 0),
+        per_member: members.map(m => ({ member_id: m.id, paid: (paid.find(r => r.c === cur && r.p === m.id) || {}).a || 0, share: (owed.find(r => r.c === cur && r.m === m.id) || {}).a || 0 })),
+        balances: members.map(m => ({ member_id: m.id, net: net.get(m.id) })), suggested: simplify(net) };
+    };
+    const recurring = db.prepare('SELECT r.*, m.name payer_name FROM recurring r JOIN members m ON m.id=r.paid_by WHERE r.group_id=? ORDER BY r.id').all(g.id)
+      .map(r => ({ id: r.id, description: r.description, amount: r.amount, currency: r.currency, freq: r.freq, next_due: r.next_due, payer_name: r.payer_name, can_stop: r.created_by === req.user.id || g.owner_id === req.user.id }));
+    res.json({ me: myMember(req, g), group: { id: g.id, name: g.name, is_owner: g.owner_id === req.user.id }, members: members.map(m => ({ ...m, is_user: !!m.is_user })), expenses, settlements, recurring, currencies: (curs.length ? curs : ['INR']).map(perCur) });
   }));
   app.put('/api/groups/:id', wrap((req, res) => {
     const g = gid(req); if (g.owner_id !== req.user.id) bad('Only the group owner can rename it', 403);
@@ -179,19 +228,44 @@ function createApp(db, opts = {}) {
     if (shares.some(s => !ids.has(s.member_id))) bad('Unknown member in split');
     const spent_on = typeof b.spent_on === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(b.spent_on) && !isNaN(Date.parse(b.spent_on)) ? b.spent_on : null;
     const category = CATS.includes(b.category) ? b.category : 'general';
-    return { desc, amount, paid_by: b.paid_by, split_type: b.split_type, shares, spent_on, category,
+    const currency = /^[A-Za-z]{3}$/.test(String(b.currency || '')) ? String(b.currency).toUpperCase() : 'INR';
+    return { desc, amount, paid_by: b.paid_by, split_type: b.split_type, shares, spent_on, category, currency,
       note: typeof b.note === 'string' ? b.note.slice(0, 500) : null, spec_json: JSON.stringify(b.spec || {}),
       ocr_text: typeof b.ocr_text === 'string' && b.ocr_text ? b.ocr_text.slice(0, 20000) : null };
   }
   app.post('/api/groups/:id/expenses', wrap((req, res) => {
     const g = gid(req); const x = parseExpense(g, req.body);
     const id = db.transaction(() => {
-      const eId = db.prepare('INSERT INTO expenses(group_id,description,amount,paid_by,split_type,note,created_by,spent_on,category,spec_json,ocr_text) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-        .run(g.id, x.desc, x.amount, x.paid_by, x.split_type, x.note, req.user.id, x.spent_on, x.category, x.spec_json, x.ocr_text).lastInsertRowid;
+      const eId = db.prepare('INSERT INTO expenses(group_id,description,amount,paid_by,split_type,note,created_by,spent_on,category,spec_json,ocr_text,currency) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(g.id, x.desc, x.amount, x.paid_by, x.split_type, x.note, req.user.id, x.spent_on, x.category, x.spec_json, x.ocr_text, x.currency).lastInsertRowid;
       for (const s of x.shares) db.prepare('INSERT INTO splits VALUES(?,?,?)').run(eId, s.member_id, s.share);
       return eId;
     })();
+    notifyGroup(g.id, req.user.id, `${req.user.name} added "${x.desc}" (${fmtMoney(x.amount, x.currency)})`);
     res.status(201).json({ id, shares: x.shares });
+  }));
+
+  // Recurring expenses: the first one is saved now, the rule repeats it weekly or monthly.
+  app.post('/api/groups/:id/recurring', wrap((req, res) => {
+    const g = gid(req); const freq = req.body.freq === 'monthly' ? 'monthly' : 'weekly';
+    const x = parseExpense(g, req.body);
+    const start = x.spent_on || new Date().toISOString().slice(0, 10);
+    const id = db.transaction(() => {
+      const eId = db.prepare('INSERT INTO expenses(group_id,description,amount,paid_by,split_type,note,created_by,spent_on,category,spec_json,currency) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+        .run(g.id, x.desc, x.amount, x.paid_by, x.split_type, x.note, req.user.id, start, x.category, x.spec_json, x.currency).lastInsertRowid;
+      for (const s of x.shares) db.prepare('INSERT INTO splits VALUES(?,?,?)').run(eId, s.member_id, s.share);
+      return db.prepare('INSERT INTO recurring(group_id,description,amount,paid_by,split_type,spec_json,category,currency,note,freq,next_due,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(g.id, x.desc, x.amount, x.paid_by, x.split_type, x.spec_json, x.category, x.currency, x.note, freq, advance(start, freq), req.user.id).lastInsertRowid;
+    })();
+    notifyGroup(g.id, req.user.id, `${req.user.name} added "${x.desc}" (${fmtMoney(x.amount, x.currency)}, repeats ${freq})`);
+    res.status(201).json({ id, next_due: advance(start, freq) });
+  }));
+  app.delete('/api/groups/:gid/recurring/:rid', wrap((req, res) => {
+    req.params.id = req.params.gid; const g = gid(req);
+    const r = db.prepare('SELECT * FROM recurring WHERE id=? AND group_id=?').get(+req.params.rid, g.id);
+    if (!r) bad('Not found', 404);
+    if (r.created_by !== req.user.id && g.owner_id !== req.user.id) bad('Only its creator or the group owner can stop it', 403);
+    db.prepare('DELETE FROM recurring WHERE id=?').run(r.id); res.json({ ok: true });
   }));
   const ownExpense = (req, g) => {
     const e = db.prepare('SELECT * FROM expenses WHERE id=? AND group_id=?').get(+req.params.eid, g.id);
@@ -201,11 +275,12 @@ function createApp(db, opts = {}) {
   app.put('/api/groups/:gid/expenses/:eid', wrap((req, res) => {
     req.params.id = req.params.gid; const g = gid(req); const e = ownExpense(req, g); const x = parseExpense(g, req.body);
     db.transaction(() => {
-      db.prepare("UPDATE expenses SET description=?,amount=?,paid_by=?,split_type=?,note=?,spent_on=?,category=?,spec_json=?,ocr_text=COALESCE(?,ocr_text),edited_by=?,edited_at=datetime('now') WHERE id=?")
-        .run(x.desc, x.amount, x.paid_by, x.split_type, x.note, x.spent_on, x.category, x.spec_json, x.ocr_text, req.user.id, e.id);
+      db.prepare("UPDATE expenses SET description=?,amount=?,paid_by=?,split_type=?,note=?,spent_on=?,category=?,spec_json=?,ocr_text=COALESCE(?,ocr_text),currency=?,edited_by=?,edited_at=datetime('now') WHERE id=?")
+        .run(x.desc, x.amount, x.paid_by, x.split_type, x.note, x.spent_on, x.category, x.spec_json, x.ocr_text, x.currency, req.user.id, e.id);
       db.prepare('DELETE FROM splits WHERE expense_id=?').run(e.id);
       for (const s of x.shares) db.prepare('INSERT INTO splits VALUES(?,?,?)').run(e.id, s.member_id, s.share);
     })();
+    notifyGroup(g.id, req.user.id, `${req.user.name} edited "${x.desc}" (${fmtMoney(x.amount, x.currency)})`);
     res.json({ ok: true, shares: x.shares });
   }));
   app.delete('/api/groups/:gid/expenses/:eid', wrap((req, res) => {
@@ -251,10 +326,10 @@ function createApp(db, opts = {}) {
   app.get('/api/groups/:id/export.csv', wrap((req, res) => {
     const g = gid(req); const names = new Map(membersOf(g.id).map(m => [m.id, m.name]));
     const cell = v => { v = String(v ?? ''); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
-    const rows = [['date', 'description', 'category', 'amount', 'paid_by', 'split_type', 'shares']];
+    const rows = [['date', 'description', 'category', 'currency', 'amount', 'paid_by', 'split_type', 'shares']];
     for (const e of db.prepare('SELECT * FROM expenses WHERE group_id=? ORDER BY id').all(g.id)) {
       const sh = db.prepare('SELECT member_id,share FROM splits WHERE expense_id=?').all(e.id).map(s => `${names.get(s.member_id)}=${(s.share / 100).toFixed(2)}`).join('; ');
-      rows.push([e.spent_on || String(e.created_at).slice(0, 10), e.description, e.category, (e.amount / 100).toFixed(2), names.get(e.paid_by), e.split_type, sh]);
+      rows.push([e.spent_on || String(e.created_at).slice(0, 10), e.description, e.category, e.currency, (e.amount / 100).toFixed(2), names.get(e.paid_by), e.split_type, sh]);
     }
     res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="splitsnap-export.csv"' }); res.send(rows.map(r => r.map(cell).join(',')).join('\n') + '\n');
   }));
@@ -280,6 +355,7 @@ function createApp(db, opts = {}) {
     const i = findInvite(req.body.token); if (!i || i.muid) bad('This invite link is invalid, expired or already used', 404);
     if (db.prepare('SELECT 1 FROM members WHERE group_id=? AND user_id=?').get(i.group_id, req.user.id)) bad('You are already a member of this group');
     db.transaction(() => { db.prepare('UPDATE members SET user_id=? WHERE id=? AND user_id IS NULL').run(req.user.id, i.member_id); db.prepare('DELETE FROM invites WHERE member_id=?').run(i.member_id); })();
+    notifyGroup(i.group_id, req.user.id, `${req.user.name} joined the group as ${i.mname}`);
     res.json({ group_id: i.group_id });
   }));
 
@@ -288,7 +364,9 @@ function createApp(db, opts = {}) {
     const ids = new Set(membersOf(g.id).map(m => m.id));
     if (!ids.has(f) || !ids.has(t) || f === t) bad('Pick two different members');
     if (!Number.isInteger(a) || a <= 0) bad('Amount must be more than 0');
-    const id = db.prepare('INSERT INTO settlements(group_id,from_member,to_member,amount) VALUES(?,?,?,?)').run(g.id, f, t, a).lastInsertRowid;
+    const cur = /^[A-Za-z]{3}$/.test(String(req.body.currency || '')) ? String(req.body.currency).toUpperCase() : 'INR';
+    const id = db.prepare('INSERT INTO settlements(group_id,from_member,to_member,amount,currency) VALUES(?,?,?,?,?)').run(g.id, f, t, a, cur).lastInsertRowid;
+    notifyGroup(g.id, req.user.id, `${req.user.name} recorded a payment of ${fmtMoney(a, cur)}`);
     res.status(201).json({ id });
   }));
   app.delete('/api/groups/:gid/settlements/:sid', wrap((req, res) => {
