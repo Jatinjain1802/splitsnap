@@ -1,0 +1,11 @@
+*{box-sizing:border-box}body{margin:0;font:16px system-ui,sans-serif;background:#f4f6f8;color:#1c2430}
+header{background:#1f9d73;padding:14px 18px}header a{color:#fff;font-weight:700;font-size:20px;text-decoration:none}
+main{max-width:720px;margin:0 auto;padding:16px}.card{background:#fff;border-radius:10px;padding:14px;margin:12px 0;box-shadow:0 1px 3px #0001}
+h2,h3{margin:.2em 0 .6em}input,select,button{font:inherit;padding:8px 10px;border:1px solid #c7ced6;border-radius:8px;background:#fff}
+button{cursor:pointer;background:#1f9d73;color:#fff;border-color:#1f9d73}button.sec{background:#fff;color:#1c2430;border-color:#c7ced6}button.del{background:#fff;color:#c0392b;border-color:#e6b0aa;padding:4px 8px}
+.row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}.row>input[type=text],.row>input:not([type]){flex:1;min-width:120px}
+.pos{color:#1f9d73;font-weight:600}.neg{color:#c0392b;font-weight:600}.muted{color:#69758a;font-size:14px}
+.pill{display:inline-flex;gap:4px;align-items:center;border:1px solid #c7ced6;border-radius:99px;padding:3px 10px;margin:2px;font-size:14px}
+.tabs button{background:#fff;color:#1c2430;border-color:#c7ced6}.tabs button.on{background:#1c2430;color:#fff}
+.warn{background:#fff3cd;border-radius:8px;padding:8px;margin:8px 0}.item{border-top:1px solid #eee;padding:6px 0}
+#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#1c2430;color:#fff;padding:10px 16px;border-radius:8px;display:none}
