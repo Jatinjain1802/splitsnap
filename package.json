@@ -1,0 +1,19 @@
+{
+  "name": "splitsnap",
+  "version": "1.0.0",
+  "description": "Splitwise-style expense splitter with bill photo OCR",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.2.0",
+    "express": "^5.3.0",
+    "multer": "^2.5.0",
+    "tesseract.js": "^7.0.0"
+  }
+}
