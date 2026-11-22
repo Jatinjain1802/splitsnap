@@ -34,8 +34,8 @@ test('edit expense, receipt privacy, csv, totals', async t => {
   const edit = await A(`/groups/${id}/expenses/${ex.b.id}`, 'PUT', { description: 'Dinner', amount: 60000, paid_by: b, split_type: 'exact', spec: { rows: [{ member_id: a, amount: 10000 }, { member_id: ravi, amount: 20000 }, { member_id: b, amount: 30000 }] }, category: 'food' });
   assert.equal(edit.s, 200);
   g = (await A(`/groups/${id}`)).b;
-  assert.equal(g.balances.find(x => x.member_id === b).net, 30000);
-  assert.equal(g.expenses[0].description, 'Dinner'); assert.ok(g.expenses[0].edited_at); assert.equal(g.totals.spent, 60000);
+  assert.equal(g.currencies[0].balances.find(x => x.member_id === b).net, 30000);
+  assert.equal(g.expenses[0].description, 'Dinner'); assert.ok(g.expenses[0].edited_at); assert.equal(g.currencies[0].spent, 60000);
   assert.equal((await A(`/groups/${id}/expenses/${ex.b.id}`, 'PUT', { description: 'x', amount: 100, paid_by: a, split_type: 'exact', spec: { rows: [] } })).s, 400);
   // receipt: member-only, real image only
   const up = async (cl, body, type = 'image/png') => { const fd = new FormData(); fd.append('receipt', new Blob([body], { type }), 'r.png'); return cl.raw(`/groups/${id}/expenses/${ex.b.id}/receipt`, { method: 'POST', body: fd }); };
@@ -67,7 +67,7 @@ test('guest claim: owner-only, single use, history kept', async t => {
   assert.equal((await A('/claim', 'POST', { token: inv.b.token })).s, 400); // owner is already a member
   assert.equal((await B('/claim', 'POST', { token: inv.b.token })).s, 200);
   assert.equal((await C('/claim', 'POST', { token: inv.b.token })).s, 404); // single use
-  g = (await B(`/groups/${id}`)).b; assert.equal(g.me, ravi); assert.equal(g.balances.find(x => x.member_id === ravi).net, -5000);
+  g = (await B(`/groups/${id}`)).b; assert.equal(g.me, ravi); assert.equal(g.currencies[0].balances.find(x => x.member_id === ravi).net, -5000);
   assert.equal((await A('/claim', 'POST', { token: inv.b.token })).s, 404);
 });
 
