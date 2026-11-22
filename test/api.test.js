@@ -29,10 +29,10 @@ test("auth, authorization, expenses, balances, settle-up", async t => {
   assert.equal((await B(`/groups/${id}`)).s, 200);
   const ex = await A(`/groups/${id}/expenses`, 'POST', { description: 'Dinner', amount: 30000, paid_by: a, split_type: 'equal', spec: { members: [a, ravi, b] } });
   assert.equal(ex.s, 201);
-  g = (await A(`/groups/${id}`)).b; assert.equal(g.balances.find(x => x.member_id === a).net, 20000);
+  g = (await A(`/groups/${id}`)).b; assert.equal(g.currencies[0].balances.find(x => x.member_id === a).net, 20000);
   assert.equal((await B(`/groups/${id}/expenses/${ex.b.id}`, 'DELETE')).s, 404); // not creator/owner
   await B(`/groups/${id}/settlements`, 'POST', { from_member: b, to_member: a, amount: 10000 });
-  g = (await A(`/groups/${id}`)).b; assert.equal(g.balances.find(x => x.member_id === b).net, 0);
+  g = (await A(`/groups/${id}`)).b; assert.equal(g.currencies[0].balances.find(x => x.member_id === b).net, 0);
   assert.equal((await A(`/groups/${id}/expenses`, 'POST', { description: 'x', amount: 100, paid_by: a, split_type: 'exact', spec: { rows: [{ member_id: a, amount: 5 }] } })).s, 400);
   assert.equal((await B(`/groups/${id}`, 'DELETE')).s, 403);
   assert.equal((await A(`/groups/${id}/expenses/${ex.b.id}`, 'DELETE')).s, 200);
