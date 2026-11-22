@@ -178,7 +178,7 @@ async function notifsScreen() {
 async function route() {
   const me = await api('/me').catch(() => null);
   let bell = '';
-  if (me) { const n = await api('/notifications').catch(() => null); if (n) bell = ` <a href="#/notifs" title="Notifications" style="font-weight:400;font-size:14px">${n.unread ? `🔔 ${n.unread}` : '🔕'}</a>`; }
+  if (me) { const n = await api('/notifications').catch(() => null); if (n) bell = ` <a href="#/notifs" title="Notifications" style="font-weight:400;font-size:14px">${n.unread ? `Alerts <b style="background:#fff;color:#1f9d73;border-radius:99px;padding:0 7px">${n.unread}</b>` : 'Alerts'}</a>`; }
   document.getElementById('who').innerHTML = me ? `${esc(me.name)}${me.email_enabled && !me.email_verified ? ' <a href="#" id="vr" style="font-weight:400;font-size:14px">Verify email</a>' : ''}${bell} <a href="#/" id="lo" style="font-weight:400;font-size:14px">Log out</a>` : '';
   const pre = location.hash.match(/^#\/(reset|verify)\/([a-f0-9]+)/);
   if (pre) return pre[1] === 'reset' ? resetScreen(pre[2]) : verifyScreen(pre[2]);
@@ -203,4 +203,4 @@ async function claimScreen(token) {
   const p = await api('/claim/preview', 'POST', { token });
   $app.innerHTML = `<div class="card"><h2>Join "${esc(p.group)}"</h2><p>You will take over the guest <b>${esc(p.guest)}</b>, including their expenses and balance, and see everything in this group. Only continue if this link was meant for you.</p><button id="cb">Yes, that is me</button> <a href="#/">Cancel</a></div>`;
   cb.onclick = guard(async () => { const r = await api('/claim', 'POST', { token }); location.hash = '#/g/' + r.group_id; });
-                                                                                                                                 }
+}
